@@ -10,8 +10,9 @@ every browser session leaves the Tor network through a different exit relay.
 2. Runs `SESSIONS` (default 10) sessions. For each session it:
    - adds every exit relay used so far to `ExcludeExitNodes` and sends `SIGNAL NEWNYM`, so the
      session gets fresh circuits that can't end at a previously used exit;
-   - launches Firefox with a fresh, throwaway profile, proxied through the Tor SOCKS port;
-   - opens https://example.com/, reads the circuit that carried it from Tor's control port and
+   - launches Firefox with a fresh, throwaway profile, pointed at our Tor client (Tor Browser
+     skips its own launcher via `TOR_SKIP_LAUNCH` and connects to our control port);
+   - opens `TARGET_URL` (https://www.tiktok.com/ by default), reads the circuit that carried it from Tor's control port and
      prints the exit relay's IP, nickname and fingerprint;
    - opens https://check.torproject.org/api/ip to confirm the traffic is Tor and print the
      public IP the site saw;
@@ -34,6 +35,7 @@ Configuration (environment variables):
 | `TOR_PATH`         | `$TOR_BROWSER_ROOT/TorBrowser/Tor/tor(.exe)`    |
 | `TOR_GEOIP_DIR`    | `$TOR_BROWSER_ROOT/TorBrowser/Data/Tor`         |
 | `SESSIONS`         | `10`                                            |
+| `TARGET_URL`       | `https://www.tiktok.com/`                       |
 | `HEADLESS`         | unset (set to `1` to hide the browser window)   |
 
 `npm test` runs unit tests for the Tor control-port client against a fake control server.

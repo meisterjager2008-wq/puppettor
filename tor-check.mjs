@@ -15,10 +15,9 @@ const TOR_BUNDLE_DATA = process.env.TOR_GEOIP_DIR ?? path.join(TOR_BROWSER_ROOT,
 const SESSIONS = Number.parseInt(process.env.SESSIONS ?? '10', 10);
 const HEADLESS = process.env.HEADLESS === '1';
 const SOCKS_HOST = '127.0.0.1';
-const TARGET_URL = 'https://example.com/';
-const TARGET_HOST = 'example.com:443';
+const TARGET_URL = process.env.TARGET_URL ?? 'https://www.tiktok.com/';
 const CHECK_URL = 'https://check.torproject.org/api/ip';
-const CHECK_HOST = 'check.torproject.org:443';
+const CHECK_HOST = 'check.torproject.org';
 // Tor ignores NEWNYM signals sent less than 10 seconds apart.
 const NEWNYM_INTERVAL_MS = 10500;
 
@@ -159,7 +158,9 @@ async function startTorClient(runtimeDir, socksPort, controlPort) {
   const cookieFile = path.join(torDataDir, 'control_auth_cookie');
   const defaultsFile = path.join(runtimeDir, 'empty-tor-defaults');
   const torrcFile = path.join(runtimeDir, 'torrc');
-  const torPath = (value) => path.resolve(value).replaceAll('\\', '/');
+  // Tor on Windows only treats "C:\\..." (backslashes) as absolute, so keep native separators
+  // and escape them inside the quoted torrc value.
+  const torPath = (value) => `"${path.resolve(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
   const geoip = path.join(TOR_BUNDLE_DATA, 'geoip');
   const geoip6 = path.join(TOR_BUNDLE_DATA, 'geoip6');
   await fs.writeFile(defaultsFile, '');
@@ -168,8 +169,8 @@ async function startTorClient(runtimeDir, socksPort, controlPort) {
     `ControlPort ${SOCKS_HOST}:${controlPort}`,
     'CookieAuthentication 1',
     `DataDirectory ${torPath(torDataDir)}`,
-    ...(await exists(geoip) ? [`GeoIPFile "${torPath(geoip)}"`] : []),
-    ...(await exists(geoip6) ? [`GeoIPv6File "${torPath(geoip6)}"`] : []),
+    ...(await exists(geoip) ? [`GeoIPFile ${torPath(geoip)}`] : []),
+    ...(await exists(geoip6) ? [`GeoIPv6File ${torPath(geoip6)}`] : []),
     'DisableNetwork 0',
     'AvoidDiskWrites 1',
     'SafeLogging 1',
@@ -243,7 +244,9 @@ async function startTorClient(runtimeDir, socksPort, controlPort) {
   throw new Error('Tor did not finish connecting within five minutes');
 }
 
-async function waitForStream(streams, target, timeoutMs = 30000) {
+// Finds the circuit that carried a connection to `hostname` (port 443).
+async function waitForStream(streams, hostname, timeoutMs = 30000) {
+  const target = `${hostname}:443`;
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const match = streams.findLast((stream) => stream.status === 'SUCCEEDED'
@@ -279,15 +282,17 @@ export async function getExitRelay(control, circuitId) {
 
 // Keep every exit used so far out of future circuits, then ask Tor for fresh circuits.
 async function rotateCircuits(control, usedExits, state) {
-  const excluded = [...usedExits.keys()].map((fingerprint) => `$${fingerprint}`).join(',');
-  await control.commandOk(`SETCONF ExcludeExitNodes="${excluded}"`);
+  if (usedExits.size > 0) {
+    const excluded = [...usedExits.keys()].map((fingerprint) => `$${fingerprint}`).join(',');
+    await control.commandOk(`SETCONF ExcludeExitNodes="${excluded}"`);
+  }
   const wait = state.lastNewnym + NEWNYM_INTERVAL_MS - Date.now();
   if (wait > 0) await delay(wait);
   await control.commandOk('SIGNAL NEWNYM');
   state.lastNewnym = Date.now();
 }
 
-async function runSession(number, { control, socksPort, runtimeDir, streams }) {
+async function runSession(number, { control, socksPort, controlPort, runtimeDir, streams }) {
   const profileDir = await fs.mkdtemp(path.join(runtimeDir, `firefox-profile-${number}-`));
   streams.length = 0;
   let browser;
@@ -300,6 +305,17 @@ async function runSession(number, { control, socksPort, runtimeDir, streams }) {
       headless: HEADLESS,
       userDataDir: profileDir,
       timeout: 30000,
+      // Tell Tor Browser not to launch its own tor but to use ours, so it shows as connected
+      // instead of holding pages at about:torconnect.
+      env: {
+        ...process.env,
+        TOR_SKIP_LAUNCH: '1',
+        TOR_SOCKS_HOST: SOCKS_HOST,
+        TOR_SOCKS_PORT: String(socksPort),
+        TOR_CONTROL_HOST: SOCKS_HOST,
+        TOR_CONTROL_PORT: String(controlPort),
+        TOR_CONTROL_COOKIE_AUTH_FILE: path.join(runtimeDir, 'tor-data', 'control_auth_cookie'),
+      },
       extraPrefsFirefox: {
         'network.proxy.type': 1,
         'network.proxy.socks': SOCKS_HOST,
@@ -319,15 +335,24 @@ async function runSession(number, { control, socksPort, runtimeDir, streams }) {
     });
     const page = await browser.newPage();
     page.on('requestfailed', (request) => {
+      if (!request.isNavigationRequest()) return;
       console.error(`  Request failed: ${request.url()} (${request.failure()?.errorText ?? 'unknown error'})`);
     });
 
-    await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 120000 });
-    const title = await page.title();
-    const exit = await getExitRelay(control, (await waitForStream(streams, TARGET_HOST)).circuitId);
-    console.log(`  Visited ${page.url()} ("${title}")`);
-    console.log(`  Exit relay: ${exit.ipv4} ${exit.nickname} (${exit.fingerprint})`);
+    console.log(`  Opening ${TARGET_URL}…`);
+    try {
+      await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 120000 });
+    } catch (error) {
+      // Heavy sites can time out over Tor even though the connection itself worked.
+      console.warn(`  Warning: page did not finish loading: ${error.message}`);
+    }
+    const hostname = new URL(page.url().startsWith('http') ? page.url() : TARGET_URL).hostname;
+    const title = await page.title().catch(() => '');
+    const exit = await getExitRelay(control, (await waitForStream(streams, hostname)).circuitId);
+    console.log(`  Visited ${page.url()}${title ? ` ("${title}")` : ''}`);
+    console.log(`  >>> IP address used for ${hostname}: ${exit.ipv4}  (exit relay ${exit.nickname}, ${exit.fingerprint})`);
 
+    // Tor Browser isolates circuits per site, so the check page may use a different circuit.
     await page.goto(CHECK_URL, { waitUntil: 'domcontentloaded', timeout: 120000 });
     const body = await page.evaluate(() => document.body.innerText);
     let result;
@@ -340,12 +365,10 @@ async function runSession(number, { control, socksPort, runtimeDir, streams }) {
       throw new Error(`Tor check did not confirm a Tor exit IP: ${body.slice(0, 200)}`);
     }
     const checkExit = await getExitRelay(control, (await waitForStream(streams, CHECK_HOST)).circuitId);
-    if (checkExit.fingerprint !== exit.fingerprint) {
-      console.warn(`  Warning: IP check used a different exit (${checkExit.fingerprint}), public IP may not match.`);
-    }
-    console.log(`  Public IP reported by check.torproject.org: ${result.IP}`
-      + ` (${result.IP === exit.ipv4 ? 'matches' : 'differs from'} the relay's consensus address)`);
-    return { ...exit, publicIp: result.IP };
+    const sameCircuit = checkExit.fingerprint === exit.fingerprint;
+    console.log(`  check.torproject.org confirms Tor, it saw IP ${result.IP}`
+      + (sameCircuit ? ' (same exit relay)' : ` (separate circuit via ${checkExit.ipv4})`));
+    return { ...exit, publicIp: result.IP, otherExits: sameCircuit ? [] : [checkExit.fingerprint] };
   } finally {
     await browser?.close().catch(() => {});
     await fs.rm(profileDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 })
@@ -360,7 +383,7 @@ function printSummary(results) {
   for (const result of results) {
     if (result.fingerprint) {
       fingerprints.set(result.fingerprint, (fingerprints.get(result.fingerprint) ?? 0) + 1);
-      ips.set(result.publicIp, (ips.get(result.publicIp) ?? 0) + 1);
+      ips.set(result.ipv4, (ips.get(result.ipv4) ?? 0) + 1);
     }
   }
   for (const result of results) {
@@ -369,13 +392,13 @@ function printSummary(results) {
       console.log(`${label} FAILED - ${result.error}`);
       continue;
     }
-    const duplicate = fingerprints.get(result.fingerprint) > 1 || ips.get(result.publicIp) > 1;
-    console.log(`${label} ${result.publicIp.padEnd(15)} ${result.fingerprint} ${duplicate ? 'DUPLICATE' : 'unique'}`);
+    const duplicate = fingerprints.get(result.fingerprint) > 1 || ips.get(result.ipv4) > 1;
+    console.log(`${label} ${result.ipv4.padEnd(15)} ${result.fingerprint} ${duplicate ? 'DUPLICATE' : 'unique'}`);
   }
   const succeeded = results.filter((result) => !result.error);
   const allUnique = fingerprints.size === succeeded.length && ips.size === succeeded.length;
   console.log(`\n${succeeded.length}/${results.length} sessions succeeded; `
-    + `${fingerprints.size} distinct exit relays, ${ips.size} distinct public IPs.`);
+    + `${fingerprints.size} distinct exit relays, ${ips.size} distinct exit IPs.`);
   console.log(allUnique && succeeded.length === results.length
     ? 'PASS: every session used a unique exit relay.'
     : 'FAIL: not every session completed with a unique exit relay.');
@@ -421,12 +444,13 @@ async function run() {
       console.log(`\n--- Session ${number}/${SESSIONS} ---`);
       try {
         await rotateCircuits(control, usedExits, newnymState);
-        const exit = await runSession(number, { control, socksPort, runtimeDir, streams });
+        const exit = await runSession(number, { control, socksPort, controlPort, runtimeDir, streams });
         if (usedExits.has(exit.fingerprint)) {
           console.error(`  Exit relay ${exit.fingerprint} was already used in session ${usedExits.get(exit.fingerprint)}!`);
         } else {
           usedExits.set(exit.fingerprint, number);
         }
+        for (const fingerprint of exit.otherExits) if (!usedExits.has(fingerprint)) usedExits.set(fingerprint, number);
         results.push({ number, ...exit });
       } catch (error) {
         console.error(`  Session ${number} failed: ${error.message}`);
