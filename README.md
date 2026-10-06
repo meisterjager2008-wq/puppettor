@@ -23,22 +23,21 @@ every browser session leaves the Tor network through a different exit relay.
 
 ## Page steps
 
-Edit the `STEPS` array near the top of `tor-check.mjs`; each entry runs in order on the target
-page in every session. Element steps wait until the element is visible, enabled, scrolled into
-view and stable before acting, and retry if the page re-renders it.
+Edit the `STEPS` array near the top of `tor-check.mjs`. Every step is the same: wait until
+the element is visible, click it, move on. A step written as `{ scrollIn, selector }` first
+scrolls down inside the `scrollIn` container until `selector` is visible, then clicks it.
 
 ```js
 const STEPS = [
-  { name: 'Accept cookies', action: 'click', selector: 'button::-p-text(Accept all)', optional: true },
-  { action: 'click', selector: '#search-button' },
-  { action: 'type', selector: 'input[type="search"]', text: 'cats' },
-  { action: 'press', key: 'Enter' },
-  { action: 'waitFor', selector: '[data-e2e="search-results"]', timeout: 60000 },
-  { action: 'sleep', ms: 3000 },
+  'button::-p-text(Accept all)',
+  '#some-button',
+  '[data-e2e="tab"]',
+  { scrollIn: '#list-container', selector: 'button::-p-text(Load more)' },
 ];
 ```
 
-A failing step (unless `optional: true`) marks the session failed and moves on to the next one.
+Each step waits up to 30s (`STEP_TIMEOUT_MS`). A step that never becomes visible marks the
+session failed, and the next session starts.
 
 ## Usage
 

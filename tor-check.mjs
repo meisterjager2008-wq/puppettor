@@ -22,19 +22,10 @@ const CHECK_HOST = 'check.torproject.org';
 const NEWNYM_INTERVAL_MS = 10500;
 
 // ---------------------------------------------------------------------------
-// STEPS: actions run, in order, on TARGET_URL in every session once the page has
-// fully loaded. Each step waits until its element is visible, enabled, scrolled into
-// view and no longer moving before acting, and retries if the page re-renders it.
-//
-//   { action: 'click',   selector: 'button.accept' }
-//   { action: 'type',    selector: 'input[name="q"]', text: 'cats' }  // clears the field first
-//   { action: 'press',   key: 'Enter' }                               // keyboard key
-//   { action: 'hover',   selector: '#menu' }
-//   { action: 'waitFor', selector: '.results' }                       // just wait until visible
-//   { action: 'sleep',   ms: 2000 }                                   // fixed pause
-//
-// Optional per step: timeout (ms, default STEP_TIMEOUT_MS), optional: true (skip instead of
-// failing the session if the element never appears), name: 'label for the log'.
+// STEPS: run in order on TARGET_URL in every session once the page has fully loaded.
+// Every step is the same: wait until the element is visible, click it, go to the next.
+// A step written as { scrollIn, selector } first scrolls down inside the `scrollIn`
+// container until `selector` shows up, then clicks it.
 //
 // Selectors are Puppeteer selectors: CSS, plus
 //   'button::-p-text(Accept all)'       element containing that text
@@ -43,8 +34,10 @@ const NEWNYM_INTERVAL_MS = 10500;
 //   'host-element >>> button'           pierce into shadow DOM
 // ---------------------------------------------------------------------------
 const STEPS = [
-  // { name: 'Accept cookies', action: 'click', selector: 'tiktok-cookie-banner >>> button::-p-text(Allow all)', optional: true },
-  // { action: 'click', selector: 'YOUR SELECTOR HERE' },
+  'STEP 1 SELECTOR',
+  'STEP 2 SELECTOR',
+  'STEP 3 SELECTOR',
+  { scrollIn: 'STEP 4 CONTAINER SELECTOR', selector: 'STEP 4 BUTTON SELECTOR' },
 ];
 const STEP_TIMEOUT_MS = 30000;
 const STEP_ATTEMPTS = 3;
@@ -328,56 +321,60 @@ async function waitForFullLoad(page) {
     .catch(() => console.log('  (network never went fully idle, continuing)'));
 }
 
-async function performStep(page, step, timeout) {
-  if (step.action === 'sleep') return delay(step.ms ?? 1000);
-  if (step.action === 'press') return page.keyboard.press(step.key);
-  if (!step.selector) throw new Error('missing selector');
-  const locator = page.locator(step.selector)
+function visibleLocator(page, selector, timeout) {
+  return page.locator(selector)
     .setTimeout(timeout)
     .setVisibility('visible')
     .setWaitForEnabled(true)
     .setEnsureElementIsInTheViewport(true)
     .setWaitForStableBoundingBox(true);
-  switch (step.action ?? 'click') {
-    case 'click': return locator.click();
-    case 'type': return locator.fill(step.text ?? '');
-    case 'hover': return locator.hover();
-    case 'waitFor': return locator.wait();
-    default: throw new Error(`unknown action "${step.action}"`);
+}
+
+// Scrolls `containerSelector` down a bit at a time until `selector` is visible, leaving it on screen.
+async function scrollUntilVisible(page, containerSelector, selector, timeout) {
+  const deadline = Date.now() + timeout;
+  const container = await visibleLocator(page, containerSelector, timeout).waitHandle();
+  try {
+    while (Date.now() < deadline) {
+      const target = await page.$(selector);
+      if (target) {
+        await target.evaluate((element) => element.scrollIntoView({ block: 'center' }));
+        const visible = await target.isVisible();
+        await target.dispose();
+        if (visible) return;
+      }
+      // Scroll most of a screenful, then give lazy-loaded content a moment to render.
+      await container.evaluate((element) => element.scrollBy({ top: element.clientHeight * 0.8 }));
+      await delay(700);
+    }
+  } finally {
+    await container.dispose();
   }
+  throw new Error(`"${selector}" did not appear while scrolling "${containerSelector}" within ${timeout}ms`);
 }
 
 async function runSteps(page) {
-  if (STEPS.length === 0) {
-    console.log('  No STEPS configured, nothing to do on the page.');
-    return;
-  }
   for (const [index, step] of STEPS.entries()) {
-    const label = `Step ${index + 1}/${STEPS.length} ${step.name ?? `${step.action ?? 'click'} ${step.selector ?? step.key ?? `${step.ms}ms`}`}`;
-    const timeout = step.timeout ?? STEP_TIMEOUT_MS;
+    const { scrollIn, selector } = typeof step === 'string' ? { selector: step } : step;
+    const label = `Step ${index + 1}/${STEPS.length} ${scrollIn ? `scroll "${scrollIn}" to ` : ''}"${selector}"`;
     let lastError;
     for (let attempt = 1; attempt <= STEP_ATTEMPTS; attempt += 1) {
       try {
-        await performStep(page, step, timeout);
+        if (scrollIn) await scrollUntilVisible(page, scrollIn, selector, STEP_TIMEOUT_MS);
+        await visibleLocator(page, selector, STEP_TIMEOUT_MS).click();
         lastError = undefined;
         break;
       } catch (error) {
         lastError = error;
-        // A timeout means the element never became usable; retrying the same wait won't help.
-        if (error.name === 'TimeoutError') break;
+        // A timeout means the element never became visible; retrying the same wait won't help.
+        if (error.name === 'TimeoutError' || /did not appear/.test(error.message)) break;
         console.warn(`  ${label}: attempt ${attempt} failed (${error.message}), retrying…`);
         await delay(1000);
       }
     }
-    if (lastError) {
-      if (step.optional) {
-        console.log(`  ${label}: skipped (${lastError.message})`);
-        continue;
-      }
-      throw new Error(`${label} failed: ${lastError.message}`);
-    }
-    console.log(`  ${label}: done`);
-    // Let any navigation or re-render the action triggered settle before the next step.
+    if (lastError) throw new Error(`${label} failed: ${lastError.message}`);
+    console.log(`  ${label}: clicked`);
+    // Let any navigation or re-render the click triggered settle before the next step.
     await delay(500);
     await page.waitForFunction(() => document.readyState === 'complete', { timeout: 60000 }).catch(() => {});
   }
