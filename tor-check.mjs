@@ -313,12 +313,39 @@ async function rotateCircuits(control, usedExits, state) {
   state.lastNewnym = Date.now();
 }
 
-// After the load event, also wait for readyState "complete" and for the network to go quiet.
-// Sites like TikTok keep background connections open, so quiet network is best effort.
-async function waitForFullLoad(page) {
-  await page.waitForFunction(() => document.readyState === 'complete', { timeout: 60000 });
-  await page.waitForNetworkIdle({ idleTime: 1000, concurrency: 2, timeout: 20000 })
-    .catch(() => console.log('  (network never went fully idle, continuing)'));
+// Opens `url` the way a user following a link would: the page itself sets location.href.
+// Puppeteer's page.goto() drives WebDriver BiDi's navigate command, which leaves sites like
+// TikTok stuck loading in Tor Browser. Then waits until the new page reports
+// readyState "complete" (fully loaded) and gives scripts a moment to render.
+async function openUrl(page, url, timeoutMs = 120000) {
+  const startUrl = page.url();
+  const navigate = () => page.evaluate((target) => { window.location.href = target; }, url).catch(() => {});
+  const readyState = () => page.evaluate(() => document.readyState).catch(() => 'navigating');
+  await navigate();
+  const started = Date.now();
+  let lastLog = started;
+  let retried = false;
+  let state = 'navigating';
+  while (Date.now() - started < timeoutMs) {
+    await delay(500);
+    const current = page.url();
+    const moved = current !== startUrl && current.startsWith('http');
+    state = await readyState();
+    if (moved && state === 'complete') {
+      await delay(2000);
+      return;
+    }
+    if (!moved && !retried && Date.now() - started > 30000) {
+      console.log('  Navigation has not started after 30s, trying again…');
+      retried = true;
+      await navigate();
+    }
+    if (Date.now() - lastLog >= 10000) {
+      console.log(`  …still loading (${Math.round((Date.now() - started) / 1000)}s, ${state}) ${current}`);
+      lastLog = Date.now();
+    }
+  }
+  throw new Error(`${url} did not finish loading within ${timeoutMs / 1000}s (state: ${state}, at ${page.url()})`);
 }
 
 function visibleLocator(page, selector, timeout) {
@@ -393,6 +420,9 @@ async function runSession(number, { control, socksPort, controlPort, runtimeDir,
       headless: HEADLESS,
       userDataDir: profileDir,
       timeout: 30000,
+      // Without this Puppeteer has Firefox report every request and copy every response body
+      // (up to 20 MB each) to the script, which bogs down heavy, video-streaming pages.
+      networkEnabled: false,
       // Tell Tor Browser not to launch its own tor but to use ours, so it shows as connected
       // instead of holding pages at about:torconnect.
       env: {
@@ -422,16 +452,11 @@ async function runSession(number, { control, socksPort, controlPort, runtimeDir,
       },
     });
     const page = await browser.newPage();
-    page.on('requestfailed', (request) => {
-      if (!request.isNavigationRequest()) return;
-      console.error(`  Request failed: ${request.url()} (${request.failure()?.errorText ?? 'unknown error'})`);
-    });
 
     console.log(`  Opening ${TARGET_URL} and waiting for it to fully load…`);
     let loadError;
     try {
-      await page.goto(TARGET_URL, { waitUntil: 'load', timeout: 120000 });
-      await waitForFullLoad(page);
+      await openUrl(page, TARGET_URL);
     } catch (error) {
       // Still report the IP below: the connection worked even if the page is too slow over Tor.
       loadError = error;
@@ -445,7 +470,7 @@ async function runSession(number, { control, socksPort, controlPort, runtimeDir,
     await runSteps(page);
 
     // Tor Browser isolates circuits per site, so the check page may use a different circuit.
-    await page.goto(CHECK_URL, { waitUntil: 'domcontentloaded', timeout: 120000 });
+    await openUrl(page, CHECK_URL);
     const body = await page.evaluate(() => document.body.innerText);
     let result;
     try {
