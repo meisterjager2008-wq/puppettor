@@ -1,0 +1,17 @@
+{
+  "name": "puppettor",
+  "version": "1.0.0",
+  "description": "Drive Tor Browser with Puppeteer and verify every session gets a unique Tor exit relay",
+  "type": "module",
+  "main": "tor-check.mjs",
+  "scripts": {
+    "start": "node tor-check.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.12.0"
+  }
+}
