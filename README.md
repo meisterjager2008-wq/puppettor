@@ -14,8 +14,8 @@ every browser session leaves the Tor network through a different exit relay.
      skips its own launcher via `TOR_SKIP_LAUNCH` and connects to our control port);
    - opens `TARGET_URL` (https://www.tiktok.com/ by default), reads the circuit that carried it from Tor's control port and
      prints the exit relay's IP, nickname and fingerprint;
-   - opens the page from inside the tab (like following a link, not the WebDriver navigate
-     command) and waits until it is fully loaded (`readyState` complete), then
+   - has Tor Browser open the page itself at startup (passed on the command line, like a tab
+     you open by hand), attaches to that tab and waits until it is fully loaded, then
      runs the `STEPS` list in order (see below);
    - opens https://check.torproject.org/api/ip to confirm the traffic is Tor and print the
      public IP the site saw;

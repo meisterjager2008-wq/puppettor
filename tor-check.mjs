@@ -312,18 +312,14 @@ async function rotateCircuits(control, usedExits, state) {
   state.lastNewnym = Date.now();
 }
 
-// Opens `url` the way a user following a link would: the page itself sets location.href.
-// Puppeteer's page.goto() drives WebDriver BiDi's navigate command, which leaves sites like
-// TikTok stuck loading in Tor Browser. Then waits until the new page reports
-// readyState "complete" (fully loaded) and gives scripts a moment to render.
-async function openUrl(page, url, timeoutMs = 120000) {
-  const startUrl = page.url();
-  const navigate = () => page.evaluate((target) => { window.location.href = target; }, url).catch(() => {});
+// Waits until the tab has left `startUrl` for an http(s) page whose readyState is "complete"
+// (fully loaded), then gives scripts a moment to render. `retry` is called once if the
+// tab still hasn't moved after 30s.
+async function waitForLoaded(page, startUrl, { timeoutMs = 120000, retry } = {}) {
   const readyState = () => page.evaluate(() => document.readyState).catch(() => 'navigating');
-  await navigate();
   const started = Date.now();
   let lastLog = started;
-  let retried = false;
+  let retried = !retry;
   let state = 'navigating';
   while (Date.now() - started < timeoutMs) {
     await delay(500);
@@ -337,14 +333,40 @@ async function openUrl(page, url, timeoutMs = 120000) {
     if (!moved && !retried && Date.now() - started > 30000) {
       console.log('  Navigation has not started after 30s, trying again…');
       retried = true;
-      await navigate();
+      await retry();
     }
     if (Date.now() - lastLog >= 10000) {
       console.log(`  …still loading (${Math.round((Date.now() - started) / 1000)}s, ${state}) ${current}`);
       lastLog = Date.now();
     }
   }
-  throw new Error(`${url} did not finish loading within ${timeoutMs / 1000}s (state: ${state}, at ${page.url()})`);
+  throw new Error(`Page did not finish loading within ${timeoutMs / 1000}s (state: ${state}, at ${page.url()})`);
+}
+
+// Opens `url` in an existing tab the way following a link would (the page sets location.href)
+// rather than with WebDriver BiDi's navigate command.
+async function openUrl(page, url) {
+  const startUrl = page.url();
+  const navigate = () => page.evaluate((target) => { window.location.href = target; }, url).catch(() => {});
+  await navigate();
+  await waitForLoaded(page, startUrl, { retry: navigate });
+}
+
+// Tor Browser opens TARGET_URL itself at startup (it is passed on the command line), the
+// same as a tab the user opened. Pages in tabs Puppeteer creates never finish loading in
+// Tor Browser, so find the browser's own tab instead.
+async function findStartupPage(browser) {
+  const deadline = Date.now() + 30000;
+  let pages = [];
+  while (Date.now() < deadline) {
+    pages = await browser.pages();
+    const page = pages.find((candidate) => candidate.url().startsWith('http'));
+    if (page) return page;
+    await delay(250);
+  }
+  // Still on about:blank (the load has not committed yet): it is the only tab there is.
+  if (pages.length === 0) throw new Error('Tor Browser did not open a tab');
+  return pages[0];
 }
 
 function visibleLocator(page, selector, timeout) {
@@ -417,6 +439,10 @@ async function runSession(number, { control, socksPort, controlPort, runtimeDir,
       protocol: 'webDriverBiDi',
       executablePath: FIREFOX,
       headless: HEADLESS,
+      // Tor Browser opens the site itself on startup, see findStartupPage().
+      args: [TARGET_URL],
+      // Don't emulate a fixed 800x600 screen, keep the real window size like a normal tab.
+      defaultViewport: null,
       userDataDir: profileDir,
       timeout: 30000,
       // Without this Puppeteer has Firefox report every request and copy every response body
@@ -467,12 +493,11 @@ async function runSession(number, { control, socksPort, controlPort, runtimeDir,
         'security.mixed_content.upgrade_display_content': false,
       },
     });
-    const page = await browser.newPage();
-
-    console.log(`  Opening ${TARGET_URL} and waiting for it to fully load…`);
+    console.log(`  Tor Browser is opening ${TARGET_URL}, waiting for it to fully load…`);
+    const page = await findStartupPage(browser);
     let loadError;
     try {
-      await openUrl(page, TARGET_URL);
+      await waitForLoaded(page, 'about:blank');
     } catch (error) {
       // Still report the IP below: the connection worked even if the page is too slow over Tor.
       loadError = error;
