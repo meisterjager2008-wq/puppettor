@@ -265,17 +265,16 @@ async function startTorClient(runtimeDir, socksPort, controlPort) {
   throw new Error('Tor did not finish connecting within five minutes');
 }
 
-// Finds the circuit that carried a connection to `hostname` (port 443).
+// Finds the circuit that carried a connection to `hostname` (any port, so http and https).
 async function waitForStream(streams, hostname, timeoutMs = 30000) {
-  const target = `${hostname}:443`;
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const match = streams.findLast((stream) => stream.status === 'SUCCEEDED'
-      && stream.target === target && stream.circuitId !== '0');
+      && stream.target.startsWith(`${hostname}:`) && stream.circuitId !== '0');
     if (match) return match;
     await delay(200);
   }
-  throw new Error(`No Tor circuit was reported for ${target}`);
+  throw new Error(`No Tor circuit was reported for ${hostname}`);
 }
 
 export async function getExitRelay(control, circuitId) {
@@ -449,6 +448,23 @@ async function runSession(number, { control, socksPort, controlPort, runtimeDir,
         'datareporting.healthreport.uploadEnabled': false,
         // Show the IP check API as raw text instead of Firefox's JSON viewer.
         'devtools.jsonview.enabled': false,
+        // Allow plain http sites: Tor Browser forces HTTPS-Only mode, which shows
+        // "Secure Site Not Available" instead of loading them. Tor Browser always runs in
+        // private browsing, so the _pbm variants are the ones that actually apply.
+        'dom.security.https_only_mode': false,
+        'dom.security.https_only_mode_pbm': false,
+        'dom.security.https_only_mode_ever_enabled': false,
+        'dom.security.https_only_mode_ever_enabled_pbm': false,
+        'dom.security.https_first': false,
+        'dom.security.https_first_pbm': false,
+        // Lowest Tor Browser security level ("Standard"): all JavaScript and media enabled.
+        'browser.security_level.security_slider': 4,
+        'browser.security_level.security_custom': false,
+        'javascript.enabled': true,
+        // Let https pages load http subresources instead of blocking them.
+        'security.mixed_content.block_active_content': false,
+        'security.mixed_content.block_display_content': false,
+        'security.mixed_content.upgrade_display_content': false,
       },
     });
     const page = await browser.newPage();
