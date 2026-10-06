@@ -21,6 +21,34 @@ const CHECK_HOST = 'check.torproject.org';
 // Tor ignores NEWNYM signals sent less than 10 seconds apart.
 const NEWNYM_INTERVAL_MS = 10500;
 
+// ---------------------------------------------------------------------------
+// STEPS: actions run, in order, on TARGET_URL in every session once the page has
+// fully loaded. Each step waits until its element is visible, enabled, scrolled into
+// view and no longer moving before acting, and retries if the page re-renders it.
+//
+//   { action: 'click',   selector: 'button.accept' }
+//   { action: 'type',    selector: 'input[name="q"]', text: 'cats' }  // clears the field first
+//   { action: 'press',   key: 'Enter' }                               // keyboard key
+//   { action: 'hover',   selector: '#menu' }
+//   { action: 'waitFor', selector: '.results' }                       // just wait until visible
+//   { action: 'sleep',   ms: 2000 }                                   // fixed pause
+//
+// Optional per step: timeout (ms, default STEP_TIMEOUT_MS), optional: true (skip instead of
+// failing the session if the element never appears), name: 'label for the log'.
+//
+// Selectors are Puppeteer selectors: CSS, plus
+//   'button::-p-text(Accept all)'       element containing that text
+//   '::-p-aria(Search)'                 by accessible name
+//   '::-p-xpath(//button[@id="x"])'     XPath
+//   'host-element >>> button'           pierce into shadow DOM
+// ---------------------------------------------------------------------------
+const STEPS = [
+  // { name: 'Accept cookies', action: 'click', selector: 'tiktok-cookie-banner >>> button::-p-text(Allow all)', optional: true },
+  // { action: 'click', selector: 'YOUR SELECTOR HERE' },
+];
+const STEP_TIMEOUT_MS = 30000;
+const STEP_ATTEMPTS = 3;
+
 export class TorControl {
   constructor(host, port) {
     this.host = host;
@@ -292,6 +320,69 @@ async function rotateCircuits(control, usedExits, state) {
   state.lastNewnym = Date.now();
 }
 
+// After the load event, also wait for readyState "complete" and for the network to go quiet.
+// Sites like TikTok keep background connections open, so quiet network is best effort.
+async function waitForFullLoad(page) {
+  await page.waitForFunction(() => document.readyState === 'complete', { timeout: 60000 });
+  await page.waitForNetworkIdle({ idleTime: 1000, concurrency: 2, timeout: 20000 })
+    .catch(() => console.log('  (network never went fully idle, continuing)'));
+}
+
+async function performStep(page, step, timeout) {
+  if (step.action === 'sleep') return delay(step.ms ?? 1000);
+  if (step.action === 'press') return page.keyboard.press(step.key);
+  if (!step.selector) throw new Error('missing selector');
+  const locator = page.locator(step.selector)
+    .setTimeout(timeout)
+    .setVisibility('visible')
+    .setWaitForEnabled(true)
+    .setEnsureElementIsInTheViewport(true)
+    .setWaitForStableBoundingBox(true);
+  switch (step.action ?? 'click') {
+    case 'click': return locator.click();
+    case 'type': return locator.fill(step.text ?? '');
+    case 'hover': return locator.hover();
+    case 'waitFor': return locator.wait();
+    default: throw new Error(`unknown action "${step.action}"`);
+  }
+}
+
+async function runSteps(page) {
+  if (STEPS.length === 0) {
+    console.log('  No STEPS configured, nothing to do on the page.');
+    return;
+  }
+  for (const [index, step] of STEPS.entries()) {
+    const label = `Step ${index + 1}/${STEPS.length} ${step.name ?? `${step.action ?? 'click'} ${step.selector ?? step.key ?? `${step.ms}ms`}`}`;
+    const timeout = step.timeout ?? STEP_TIMEOUT_MS;
+    let lastError;
+    for (let attempt = 1; attempt <= STEP_ATTEMPTS; attempt += 1) {
+      try {
+        await performStep(page, step, timeout);
+        lastError = undefined;
+        break;
+      } catch (error) {
+        lastError = error;
+        // A timeout means the element never became usable; retrying the same wait won't help.
+        if (error.name === 'TimeoutError') break;
+        console.warn(`  ${label}: attempt ${attempt} failed (${error.message}), retrying…`);
+        await delay(1000);
+      }
+    }
+    if (lastError) {
+      if (step.optional) {
+        console.log(`  ${label}: skipped (${lastError.message})`);
+        continue;
+      }
+      throw new Error(`${label} failed: ${lastError.message}`);
+    }
+    console.log(`  ${label}: done`);
+    // Let any navigation or re-render the action triggered settle before the next step.
+    await delay(500);
+    await page.waitForFunction(() => document.readyState === 'complete', { timeout: 60000 }).catch(() => {});
+  }
+}
+
 async function runSession(number, { control, socksPort, controlPort, runtimeDir, streams }) {
   const profileDir = await fs.mkdtemp(path.join(runtimeDir, `firefox-profile-${number}-`));
   streams.length = 0;
@@ -339,18 +430,22 @@ async function runSession(number, { control, socksPort, controlPort, runtimeDir,
       console.error(`  Request failed: ${request.url()} (${request.failure()?.errorText ?? 'unknown error'})`);
     });
 
-    console.log(`  Opening ${TARGET_URL}…`);
+    console.log(`  Opening ${TARGET_URL} and waiting for it to fully load…`);
+    let loadError;
     try {
-      await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 120000 });
+      await page.goto(TARGET_URL, { waitUntil: 'load', timeout: 120000 });
+      await waitForFullLoad(page);
     } catch (error) {
-      // Heavy sites can time out over Tor even though the connection itself worked.
-      console.warn(`  Warning: page did not finish loading: ${error.message}`);
+      // Still report the IP below: the connection worked even if the page is too slow over Tor.
+      loadError = error;
     }
     const hostname = new URL(page.url().startsWith('http') ? page.url() : TARGET_URL).hostname;
     const title = await page.title().catch(() => '');
     const exit = await getExitRelay(control, (await waitForStream(streams, hostname)).circuitId);
     console.log(`  Visited ${page.url()}${title ? ` ("${title}")` : ''}`);
     console.log(`  >>> IP address used for ${hostname}: ${exit.ipv4}  (exit relay ${exit.nickname}, ${exit.fingerprint})`);
+    if (loadError) throw new Error(`Page did not fully load, steps not run: ${loadError.message}`);
+    await runSteps(page);
 
     // Tor Browser isolates circuits per site, so the check page may use a different circuit.
     await page.goto(CHECK_URL, { waitUntil: 'domcontentloaded', timeout: 120000 });
